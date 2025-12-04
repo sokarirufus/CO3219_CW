@@ -1,57 +1,175 @@
 import express from 'express'
 import cors from 'cors'
 import { WebSocketServer } from 'ws'
+import { createClient } from 'redis'
+import pkg from 'pg'
+
+const { Pool } = pkg
 
 const PORT = process.env.PORT || 8080
-const app = express()
 
-app.use(cors())
-app.use(express.json())
+// Redis + Postgres config from .env (with safe fallbacks)
+const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1'
+const REDIS_PORT = process.env.REDIS_PORT || 6379
 
-// In-memory store of whiteboard states
-const boards = {}  // { boardId: { shapes: [...], lastUpdated: ... } }
+const PG_HOST = process.env.PG_HOST || '127.0.0.1'
+const PG_PORT = process.env.PG_PORT || 5432
+const PG_USER = process.env.PG_USER || 'whiteboard'
+const PG_PASSWORD = process.env.PG_PASSWORD || 'whiteboard123'
+const PG_DATABASE = process.env.PG_DATABASE || 'whiteboard'
 
-// REST endpoint: get board state
-app.get('/board/:id', (req, res) => {
-  const id = req.params.id
-  res.json(boards[id] || { shapes: [] })
-})
+async function main () {
+  const app = express()
 
-// REST endpoint: update board state
-app.post('/board/:id', (req, res) => {
-  const id = req.params.id
-  boards[id] = req.body
-  boards[id].lastUpdated = Date.now()
+  app.use(cors())
+  app.use(express.json())
 
-  // Notify all connected clients
-  broadcast(JSON.stringify({ boardId: id, state: boards[id] }))
+  // In-memory store of latest board snapshots
+  // Map<boardId, snapshot>
+  const boards = new Map()
 
-  res.json({ status: "ok" })
-})
+  // --- PostgreSQL pool (durable event log) ---
+  const pool = new Pool({
+    host: PG_HOST,
+    port: PG_PORT,
+    user: PG_USER,
+    password: PG_PASSWORD,
+    database: PG_DATABASE
+  })
 
-// Health endpoint for Prometheus / simple check
-app.get('/health', (req, res) => {
-  res.send("OK")
-})
+  console.log('Postgres pool created')
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`)
-})
+  // --- Redis pub/sub (cross-VM sync bus) ---
+  const redisUrl = `redis://${REDIS_HOST}:${REDIS_PORT}`
+  const redisPub = createClient({ url: redisUrl })
+  const redisSub = createClient({ url: redisUrl })
 
-// --- WebSocket Server ---
-const wss = new WebSocketServer({ server })
+  await redisPub.connect()
+  await redisSub.connect()
+  console.log('Connected to Redis at', redisUrl)
 
-function broadcast(msg) {
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(msg)
+  // REST endpoint: get latest board snapshot
+  app.get('/board/:id', (req, res) => {
+    const id = req.params.id
+    const snapshot = boards.get(id) || null
+    res.json({ boardId: id, snapshot })
+  })
+
+  // REST endpoint: update board via HTTP (not used by tldraw right now,
+  // but nice for debugging / future work)
+  app.post('/board/:id', (req, res) => {
+    const id = req.params.id
+    const snapshot = req.body
+    boards.set(id, snapshot)
+    res.json({ status: 'ok' })
+  })
+
+  // Health endpoint for Prometheus / simple check
+  app.get('/health', (req, res) => {
+    res.send('OK')
+  })
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`)
+  })
+
+  // --- WebSocket Server ---
+  const wss = new WebSocketServer({ server })
+
+  function broadcast (msg, except) {
+    for (const client of wss.clients) {
+      if (client !== except && client.readyState === 1) {
+        client.send(msg)
+      }
+    }
+  }
+
+  // When we get a message from Redis, push it to all local WS clients
+  redisSub.subscribe('whiteboard-events', (message) => {
+    const str = message.toString()
+    let msg
+    try {
+      msg = JSON.parse(str)
+    } catch (e) {
+      console.error('Bad JSON from Redis:', e)
+      return
+    }
+
+    if (msg.type === 'snapshot') {
+      const boardId = msg.boardId || 'default'
+      boards.set(boardId, msg.snapshot)
+    }
+
+    broadcast(str) // fan-out to all clients on THIS VM
+  })
+
+  wss.on('connection', (ws) => {
+    console.log('Client connected')
+
+    ws.on('message', async (raw) => {
+      const str = raw.toString()
+      let msg
+      try {
+        msg = JSON.parse(str)
+      } catch (e) {
+        console.error('Bad JSON from WS client:', e)
+        return
+      }
+
+      // Frontend asks for latest state
+      if (msg.type === 'request_snapshot') {
+        const boardId = msg.boardId || 'default'
+        const snapshot = boards.get(boardId)
+        if (snapshot) {
+          ws.send(
+            JSON.stringify({
+              type: 'snapshot',
+              boardId,
+              snapshot
+            })
+          )
+        }
+        return
+      }
+
+      // Frontend sends a new snapshot of the board
+      if (msg.type === 'snapshot') {
+        const boardId = msg.boardId || 'default'
+        const snapshot = msg.snapshot
+
+        // 1) Update in-memory snapshot
+        boards.set(boardId, snapshot)
+
+        // 2) Broadcast to all other WS clients on this VM
+        broadcast(str, ws)
+
+        // 3) Publish to Redis so other app VMs see it
+        try {
+          await redisPub.publish('whiteboard-events', str)
+        } catch (e) {
+          console.error('Failed to publish to Redis:', e)
+        }
+
+        // 4) Best-effort log into Postgres as an event
+        try {
+          await pool.query(
+            'INSERT INTO events (board_id, payload) VALUES ($1, $2)',
+            [boardId, snapshot]
+          )
+        } catch (e) {
+          console.error('Failed to insert event into Postgres:', e)
+        }
+
+        return
+      }
+
+      // Anything else is just logged for now
+      console.log('Unrecognised WS message:', msg)
+    })
   })
 }
 
-wss.on('connection', ws => {
-  console.log("Client connected")
-
-  ws.on('message', msg => {
-    // If frontend sends shape updates via WS, rebroadcast them
-    broadcast(msg.toString())
-  })
+main().catch((err) => {
+  console.error('Fatal error starting server:', err)
+  process.exit(1)
 })
