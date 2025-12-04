@@ -7,7 +7,6 @@ import { WebSocketServer } from 'ws'
 import { createClient } from 'redis'
 import pkg from 'pg'
 
-
 const { Pool } = pkg
 
 const PORT = process.env.PORT || 8080
@@ -21,6 +20,9 @@ const PG_PORT = process.env.PG_PORT || 5432
 const PG_USER = process.env.PG_USER || 'whiteboard'
 const PG_PASSWORD = process.env.PG_PASSWORD || 'whiteboard123'
 const PG_DATABASE = process.env.PG_DATABASE || 'whiteboard'
+
+// Unique ID for this node / VM so we can ignore our own Redis messages
+const NODE_ID = process.env.NODE_ID || Math.random().toString(36).slice(2)
 
 async function main () {
   const app = express()
@@ -75,6 +77,7 @@ async function main () {
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`)
+    console.log(`NODE_ID for this instance: ${NODE_ID}`)
   })
 
   // --- WebSocket Server ---
@@ -99,12 +102,18 @@ async function main () {
       return
     }
 
+    // Ignore messages published by this same node to avoid echo/flicker
+    if (msg.nodeId && msg.nodeId === NODE_ID) {
+      return
+    }
+
     if (msg.type === 'snapshot') {
       const boardId = msg.boardId || 'default'
       boards.set(boardId, msg.snapshot)
     }
 
-    broadcast(str) // fan-out to all clients on THIS VM
+    // Fan-out to all clients on THIS VM
+    broadcast(str)
   })
 
   wss.on('connection', (ws) => {
@@ -144,17 +153,21 @@ async function main () {
         // 1) Update in-memory snapshot
         boards.set(boardId, snapshot)
 
-        // 2) Broadcast to all other WS clients on this VM
-        broadcast(str, ws)
+        // 2) Tag the message with this node's ID
+        const extendedMsg = { ...msg, nodeId: NODE_ID }
+        const extendedStr = JSON.stringify(extendedMsg)
 
-        // 3) Publish to Redis so other app VMs see it
+        // 3) Broadcast to all other WS clients on this VM
+        broadcast(extendedStr, ws)
+
+        // 4) Publish to Redis so other app VMs see it
         try {
-          await redisPub.publish('whiteboard-events', str)
+          await redisPub.publish('whiteboard-events', extendedStr)
         } catch (e) {
           console.error('Failed to publish to Redis:', e)
         }
 
-        // 4) Best-effort log into Postgres as an event
+        // 5) Best-effort log into Postgres as an event
         try {
           await pool.query(
             'INSERT INTO events (board_id, payload) VALUES ($1, $2)',
