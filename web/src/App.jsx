@@ -41,7 +41,8 @@ function App () {
         if (msg.type === 'snapshot' && msg.boardId === boardId && msg.snapshot) {
           if (editorRef.current) {
             console.log('Applying snapshot from server')
-            editorRef.current.store.loadSnapshot(msg.snapshot)
+            // NOTE: use editor.loadSnapshot, not editor.store.loadSnapshot
+            editorRef.current.loadSnapshot(msg.snapshot)
           } else {
             console.warn('Got snapshot but editorRef is null')
           }
@@ -92,8 +93,12 @@ function App () {
       (event) => {
         console.log('Store changed event:', event)
 
-        const snapshot = editor.store.getSnapshot()
-        console.log('Sending snapshot to WS. Snapshot size:', Object.keys(snapshot.document || {}).length)
+        // NOTE: use editor.getSnapshot(), not editor.store.getSnapshot()
+        const snapshot = editor.getSnapshot()
+        console.log(
+          'Sending snapshot to WS. Snapshot keys:',
+          Object.keys(snapshot || {})
+        )
 
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(
