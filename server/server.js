@@ -2,7 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import { WebSocketServer } from 'ws'
 
-const PORT = process.env.PORT || 4000
+const PORT = process.env.PORT || 8080
 const app = express()
 
 app.use(cors())
@@ -34,7 +34,7 @@ app.get('/health', (req, res) => {
   res.send("OK")
 })
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`)
 })
 
