@@ -4,9 +4,13 @@ import '@tldraw/tldraw/tldraw.css'
 import './App.css'
 import { API_URL, WS_URL } from './config'
 
-function App() {
+function App () {
   const boardId = 'default'
+
   const wsRef = useRef(null)
+  const editorRef = useRef(null)
+  const unsubscribeRef = useRef(null)
+
   const [backendStatus, setBackendStatus] = useState('Checking...')
   const [wsStatus, setWsStatus] = useState('Connecting...')
 
@@ -19,11 +23,32 @@ function App() {
     ws.onopen = () => {
       console.log('Connected to WS server')
       setWsStatus('Connected')
+
+      // Ask backend for latest snapshot for this board
+      ws.send(
+        JSON.stringify({
+          type: 'request_snapshot',
+          boardId
+        })
+      )
     }
 
-    ws.onmessage = (msg) => {
-      console.log('Received WS message:', msg.data)
-      // later: handle board updates here
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data)
+        console.log('Received WS message:', msg)
+
+        if (msg.type === 'snapshot' && msg.boardId === boardId && msg.snapshot) {
+          if (editorRef.current) {
+            console.log('Applying snapshot from server')
+            editorRef.current.store.loadSnapshot(msg.snapshot)
+          } else {
+            console.warn('Got snapshot but editorRef is null')
+          }
+        }
+      } catch (e) {
+        console.error('Failed to parse WS message', e)
+      }
     }
 
     ws.onerror = (err) => {
@@ -37,9 +62,10 @@ function App() {
     }
 
     return () => {
+      console.log('Cleaning up WebSocket')
       ws.close()
     }
-  }, [])
+  }, [boardId])
 
   // Backend health check
   useEffect(() => {
@@ -56,6 +82,46 @@ function App() {
       })
   }, [])
 
+  // Called when Tldraw editor is ready
+  const handleEditorMount = (editor) => {
+    console.log('Tldraw editor mounted', editor)
+    editorRef.current = editor
+
+    // Listen for document changes and send snapshot to backend
+    const unsubscribe = editor.store.listen(
+      (event) => {
+        console.log('Store changed event:', event)
+
+        const snapshot = editor.store.getSnapshot()
+        console.log('Sending snapshot to WS. Snapshot size:', Object.keys(snapshot.document || {}).length)
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'snapshot',
+              boardId,
+              snapshot
+            })
+          )
+        } else {
+          console.warn('WS not open when trying to send snapshot')
+        }
+      },
+      { scope: 'document' }
+    )
+
+    unsubscribeRef.current = unsubscribe
+  }
+
+  // Cleanup listener on unmount
+  useEffect(() => {
+    return () => {
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current()
+      }
+    }
+  }, [])
+
   return (
     <div style={{ width: '100vw', height: '100vh', position: 'relative' }}>
       {/* Status overlay */}
@@ -69,13 +135,14 @@ function App() {
           color: 'white',
           fontSize: 12,
           borderRadius: 4,
-          zIndex: 10,
+          zIndex: 10
         }}
       >
         Board: {boardId} | Backend: {backendStatus} | WS: {wsStatus}
       </div>
 
-      <Tldraw />
+      {/* Whiteboard */}
+      <Tldraw onMount={handleEditorMount} />
     </div>
   )
 }
