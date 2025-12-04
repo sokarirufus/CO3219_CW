@@ -1,8 +1,12 @@
+import dotenv from 'dotenv'
+dotenv.config()
+
 import express from 'express'
 import cors from 'cors'
 import { WebSocketServer } from 'ws'
 import { createClient } from 'redis'
 import pkg from 'pg'
+
 
 const { Pool } = pkg
 
