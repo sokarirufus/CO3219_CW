@@ -6,6 +6,7 @@ import cors from 'cors'
 import { WebSocketServer } from 'ws'
 import { createClient } from 'redis'
 import pkg from 'pg'
+import client from 'prom-client'  // 🔥 PROMETHEUS IMPORT
 
 const { Pool } = pkg
 
@@ -29,6 +30,41 @@ async function main () {
 
   app.use(cors())
   app.use(express.json())
+
+  // -------------------------------------------
+  // 🔥 1) PROMETHEUS REGISTRY & METRICS
+  // -------------------------------------------
+  const register = new client.Registry()
+
+  // Collect default system metrics (CPU, RAM, event loop, etc.)
+  client.collectDefaultMetrics({ register })
+
+  // HTTP API Request Counter
+  const requestCount = new client.Counter({
+    name: 'whiteboard_api_requests_total',
+    help: 'Total number of API requests received',
+    labelNames: ['route', 'method']
+  })
+  register.registerMetric(requestCount)
+
+  // WebSocket connection gauge
+  const connectionGauge = new client.Gauge({
+    name: 'whiteboard_ws_connections',
+    help: 'Current number of active WebSocket connections'
+  })
+  register.registerMetric(connectionGauge)
+
+  // 🔥 Count every HTTP request automatically
+  app.use((req, res, next) => {
+    requestCount.inc({ route: req.path, method: req.method })
+    next()
+  })
+
+  // 🔥 /metrics endpoint for Prometheus
+  app.get('/metrics', async (req, res) => {
+    res.set('Content-Type', register.contentType)
+    res.end(await register.metrics())
+  })
 
   // In-memory store of latest board snapshots
   // Map<boardId, snapshot>
@@ -61,8 +97,7 @@ async function main () {
     res.json({ boardId: id, snapshot })
   })
 
-  // REST endpoint: update board via HTTP (not used by tldraw right now,
-  // but nice for debugging / future work)
+  // REST endpoint: update board via HTTP (debug / future use)
   app.post('/board/:id', (req, res) => {
     const id = req.params.id
     const snapshot = req.body
@@ -118,6 +153,11 @@ async function main () {
 
   wss.on('connection', (ws) => {
     console.log('Client connected')
+    connectionGauge.inc()   // 🔥 Track active WebSocket connections
+
+    ws.on('close', () => {
+      connectionGauge.dec() // 🔥 Track disconnects
+    })
 
     ws.on('message', async (raw) => {
       const str = raw.toString()
