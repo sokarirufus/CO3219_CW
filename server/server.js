@@ -1,18 +1,21 @@
+// Load environment variables
 import dotenv from 'dotenv'
 dotenv.config()
 
+// Imports
 import express from 'express'
 import cors from 'cors'
 import { WebSocketServer } from 'ws'
 import { createClient } from 'redis'
 import pkg from 'pg'
-import client from 'prom-client'  // 🔥 PROMETHEUS IMPORT
+import * as prom from 'prom-client'   // 🔥 UPDATED PROMETHEUS IMPORT
 
 const { Pool } = pkg
 
+// Server port
 const PORT = process.env.PORT || 8080
 
-// Redis + Postgres config from .env (with safe fallbacks)
+// Redis & Postgres config
 const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1'
 const REDIS_PORT = process.env.REDIS_PORT || 6379
 
@@ -22,7 +25,7 @@ const PG_USER = process.env.PG_USER || 'whiteboard'
 const PG_PASSWORD = process.env.PG_PASSWORD || 'whiteboard123'
 const PG_DATABASE = process.env.PG_DATABASE || 'whiteboard'
 
-// Unique ID for this node / VM so we can ignore our own Redis messages
+// Unique instance label for Prometheus (set NODE_ID=app1 or app2 on each VM)
 const NODE_ID = process.env.NODE_ID || Math.random().toString(36).slice(2)
 
 async function main () {
@@ -34,43 +37,49 @@ async function main () {
   // -------------------------------------------
   // 🔥 1) PROMETHEUS REGISTRY & METRICS
   // -------------------------------------------
-  const register = new client.Registry()
+  const register = new prom.Registry()
 
-  // Collect default system metrics (CPU, RAM, event loop, etc.)
-  client.collectDefaultMetrics({ register })
+  // Label each VM separately so Prometheus can distinguish app-1 vs app-2
+  register.setDefaultLabels({
+    instance_id: NODE_ID
+  })
 
-  // HTTP API Request Counter
-  const requestCount = new client.Counter({
+  // Collect default system metrics (CPU, memory, event loop)
+  prom.collectDefaultMetrics({ register })
+
+  // 🔥 HTTP request counter
+  const requestCount = new prom.Counter({
     name: 'whiteboard_api_requests_total',
     help: 'Total number of API requests received',
     labelNames: ['route', 'method']
   })
   register.registerMetric(requestCount)
 
-  // WebSocket connection gauge
-  const connectionGauge = new client.Gauge({
+  // 🔥 WebSocket connections gauge
+  const connectionGauge = new prom.Gauge({
     name: 'whiteboard_ws_connections',
     help: 'Current number of active WebSocket connections'
   })
   register.registerMetric(connectionGauge)
 
-  // 🔥 Count every HTTP request automatically
+  // 🔥 Automatically increment HTTP counter for each request
   app.use((req, res, next) => {
     requestCount.inc({ route: req.path, method: req.method })
     next()
   })
 
-  // 🔥 /metrics endpoint for Prometheus
+  // 🔥 Expose /metrics for Prometheus to scrape
   app.get('/metrics', async (req, res) => {
     res.set('Content-Type', register.contentType)
     res.end(await register.metrics())
   })
 
-  // In-memory store of latest board snapshots
-  // Map<boardId, snapshot>
+  // -------------------------------------------
+  // In-memory board snapshots
+  // -------------------------------------------
   const boards = new Map()
 
-  // --- PostgreSQL pool (durable event log) ---
+  // PostgreSQL pool for durable event logging
   const pool = new Pool({
     host: PG_HOST,
     port: PG_PORT,
@@ -81,7 +90,7 @@ async function main () {
 
   console.log('Postgres pool created')
 
-  // --- Redis pub/sub (cross-VM sync bus) ---
+  // Redis Pub/Sub for cross-VM sync
   const redisUrl = `redis://${REDIS_HOST}:${REDIS_PORT}`
   const redisPub = createClient({ url: redisUrl })
   const redisSub = createClient({ url: redisUrl })
@@ -90,14 +99,18 @@ async function main () {
   await redisSub.connect()
   console.log('Connected to Redis at', redisUrl)
 
-  // REST endpoint: get latest board snapshot
+  // -------------------------------------------
+  // REST Endpoints
+  // -------------------------------------------
+
+  // Get latest board snapshot
   app.get('/board/:id', (req, res) => {
     const id = req.params.id
     const snapshot = boards.get(id) || null
     res.json({ boardId: id, snapshot })
   })
 
-  // REST endpoint: update board via HTTP (debug / future use)
+  // Update board via HTTP (debug)
   app.post('/board/:id', (req, res) => {
     const id = req.params.id
     const snapshot = req.body
@@ -105,17 +118,22 @@ async function main () {
     res.json({ status: 'ok' })
   })
 
-  // Health endpoint for Prometheus / simple check
+  // Basic health endpoint
   app.get('/health', (req, res) => {
     res.send('OK')
   })
 
+  // -------------------------------------------
+  // Start HTTP Server
+  // -------------------------------------------
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`)
     console.log(`NODE_ID for this instance: ${NODE_ID}`)
   })
 
-  // --- WebSocket Server ---
+  // -------------------------------------------
+  // WebSocket Server
+  // -------------------------------------------
   const wss = new WebSocketServer({ server })
 
   function broadcast (msg, except) {
@@ -126,7 +144,7 @@ async function main () {
     }
   }
 
-  // When we get a message from Redis, push it to all local WS clients
+  // Handle Redis → WS fan-out
   redisSub.subscribe('whiteboard-events', (message) => {
     const str = message.toString()
     let msg
@@ -137,23 +155,25 @@ async function main () {
       return
     }
 
-    // Ignore messages published by this same node to avoid echo/flicker
+    // Ignore our own messages
     if (msg.nodeId && msg.nodeId === NODE_ID) {
       return
     }
 
+    // Update snapshot
     if (msg.type === 'snapshot') {
       const boardId = msg.boardId || 'default'
       boards.set(boardId, msg.snapshot)
     }
 
-    // Fan-out to all clients on THIS VM
+    // Broadcast to local clients
     broadcast(str)
   })
 
+  // Handle WebSocket connections
   wss.on('connection', (ws) => {
     console.log('Client connected')
-    connectionGauge.inc()   // 🔥 Track active WebSocket connections
+    connectionGauge.inc()   // 🔥 Track active WS connections
 
     ws.on('close', () => {
       connectionGauge.dec() // 🔥 Track disconnects
@@ -169,45 +189,42 @@ async function main () {
         return
       }
 
-      // Frontend asks for latest state
+      // Send snapshot on request
       if (msg.type === 'request_snapshot') {
         const boardId = msg.boardId || 'default'
         const snapshot = boards.get(boardId)
         if (snapshot) {
-          ws.send(
-            JSON.stringify({
-              type: 'snapshot',
-              boardId,
-              snapshot
-            })
-          )
+          ws.send(JSON.stringify({
+            type: 'snapshot',
+            boardId,
+            snapshot
+          }))
         }
         return
       }
 
-      // Frontend sends a new snapshot of the board
+      // Handle incoming snapshot updates
       if (msg.type === 'snapshot') {
         const boardId = msg.boardId || 'default'
         const snapshot = msg.snapshot
 
-        // 1) Update in-memory snapshot
         boards.set(boardId, snapshot)
 
-        // 2) Tag the message with this node's ID
+        // Tag message with nodeId
         const extendedMsg = { ...msg, nodeId: NODE_ID }
         const extendedStr = JSON.stringify(extendedMsg)
 
-        // 3) Broadcast to all other WS clients on this VM
+        // Broadcast locally
         broadcast(extendedStr, ws)
 
-        // 4) Publish to Redis so other app VMs see it
+        // Publish to Redis for other VMs
         try {
           await redisPub.publish('whiteboard-events', extendedStr)
         } catch (e) {
           console.error('Failed to publish to Redis:', e)
         }
 
-        // 5) Best-effort log into Postgres as an event
+        // Write to Postgres event log
         try {
           await pool.query(
             'INSERT INTO events (board_id, payload) VALUES ($1, $2)',
@@ -220,12 +237,12 @@ async function main () {
         return
       }
 
-      // Anything else is just logged for now
       console.log('Unrecognised WS message:', msg)
     })
   })
 }
 
+// Start main
 main().catch((err) => {
   console.error('Fatal error starting server:', err)
   process.exit(1)
