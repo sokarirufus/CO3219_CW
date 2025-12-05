@@ -1,0 +1,44 @@
+services:
+  server:
+    build: ./server
+    container_name: cw_server
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+
+  web:
+    build: ./web
+    container_name: cw_web
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cw_prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9091:9090"   # host:container
+    depends_on:
+      - server
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: cw_grafana
+    ports:
+      - "3001:3000"   # host:container
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  grafana-data:
