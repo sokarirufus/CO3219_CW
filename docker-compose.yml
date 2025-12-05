@@ -21,9 +21,9 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
+      - '--config.file=/etc/prometheus/prometheus.yml'
     ports:
-      - "9091:9090"   # host:container
+      - "9091:9090"
     depends_on:
       - server
 
@@ -31,7 +31,7 @@ services:
     image: grafana/grafana-oss:latest
     container_name: cw_grafana
     ports:
-      - "3001:3000"   # host:container
+      - "3001:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
